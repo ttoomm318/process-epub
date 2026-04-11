@@ -135,4 +135,7 @@ if __name__ == "__main__":
     # 5. Run Mokuro to process the CBZ files
     for item in Path(output_dir).iterdir():
         if item.is_dir():
+            if (item / "_no_ocr").exists():
+                print(f"[-] Skipping: {item.name} marked as no OCR")
+                continue
             subprocess.run(["mokuro", "-l=False", "--disable-confirmation=True", f"--parent_dir={item.absolute()}"])
