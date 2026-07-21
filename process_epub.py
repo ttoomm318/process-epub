@@ -21,6 +21,29 @@ svg_ns = {
     'xlink': 'http://www.w3.org/1999/xlink'
 }
 
+# ---------------------------------------------------------------------------
+# Classification tuning
+# ---------------------------------------------------------------------------
+# A spine page counts as "text-heavy" once it has at least this many
+# non-whitespace characters of body text. Manga image pages have ~none;
+# light-novel prose pages have hundreds+.
+TEXT_PAGE_MIN_CHARS = 200
+
+# Language codes treated as Japanese. Mokuro OCR only helps Japanese text, so
+# anything else is auto-marked no-OCR.
+JAPANESE_LANG_PREFIX = 'ja'
+
+# --- Manual overrides: add these as tags in Calibre before exporting ---
+# Force-treat as a light novel -> skip entirely (no CBZ, no OCR).
+FORCE_SKIP_TAGS = {'light-novel', 'light novel', 'ln', 'skip'}
+# Force-treat as manga even if the content heuristic guesses light novel.
+FORCE_MANGA_TAGS = {'manga', 'force-manga'}
+# Convert to CBZ but skip Mokuro OCR (the automated _no_ocr replacement).
+FORCE_NO_OCR_TAGS = {'no-ocr', 'no_ocr', 'noocr'}
+
+# Automatic light-novel hints from Kobo/Rakuten metadata (substring match).
+LIGHT_NOVEL_KEYWORDS = {'ライトノベル', 'ラノベ', 'light novel'}
+
 def convert_epub_to_cbz(epub_path, output_dir):
     # Unzip the EPUB file
     with zipfile.ZipFile(epub_path, 'r') as z:
@@ -64,15 +87,55 @@ def convert_epub_to_cbz(epub_path, output_dir):
         # print(f"[*] Description: {metadata['Summary']}...")
         manifest = {item.get('id'): item.get('href') for item in o_root.xpath('//opf:manifest/opf:item', namespaces=opf_ns)}
         spine_items = o_root.xpath('//opf:spine/opf:itemref', namespaces=opf_ns)
-        
+
+        # 3. Single pass over the spine: resolve each page's images and collect
+        #    the stats used to tell manga apart from light novels.
+        pages = []            # ordered list of in-zip image paths per spine entry
+        image_page_count = 0  # spine pages holding at least one image
+        text_page_count = 0   # spine pages that are text-heavy (prose)
+        for itemref in spine_items:
+            href = manifest.get(itemref.get('idref'))
+            if not href:
+                continue
+
+            full_href_path = os.path.join(opf_dir, href).replace('\\', '/')
+
+            # If spine points to HTML, find the image(s) inside it
+            if href.endswith(('.html', '.xhtml')):
+                h_root = etree.fromstring(z.read(full_href_path))
+                img_srcs = h_root.xpath('//xhtml:img/@src | //svg:image/@xlink:href | //svg:image/@href', namespaces=svg_ns)
+                img_paths = [os.path.normpath(os.path.join(os.path.dirname(full_href_path), src)).replace('\\', '/') for src in img_srcs]
+                if img_paths:
+                    image_page_count += 1
+                if visible_text_length(h_root) >= TEXT_PAGE_MIN_CHARS:
+                    text_page_count += 1
+                pages.append(img_paths)
+            # If spine points directly to an image
+            elif href.lower().endswith(('.jpg', '.jpeg', '.png')):
+                image_page_count += 1
+                pages.append([full_href_path])
+
+        # 4. Skip light novels entirely (no CBZ, no OCR).
+        if is_light_novel(metadata, image_page_count, text_page_count):
+            print(f"[-] Skipping light novel: {metadata['Title']}")
+            return
+
         cbz_path = os.path.join(output_dir, metadata['Series'], f"{metadata['Title']}.cbz")
+        series_dir = os.path.dirname(cbz_path)
+        os.makedirs(series_dir, exist_ok=True)
+
+        # 5. Auto-mark series that should skip Mokuro OCR (replaces the manual
+        #    _no_ocr file). The marker is honored by the mokuro loop below.
+        if should_skip_ocr(metadata):
+            mark_no_ocr(series_dir)
+            print(f"[*] Marking no-OCR: {metadata['Series']}")
+
         if os.path.exists(cbz_path):
             print(f"[-] Skipping: {metadata['Title']} (CBZ already exists)")
             return
-        os.makedirs(os.path.dirname(cbz_path), exist_ok=True)
 
         with zipfile.ZipFile(cbz_path, 'w', zipfile.ZIP_STORED) as cbz:
-            # 3. Save metadata into ComicInfo.xml in the CBZ
+            # 6. Save metadata into ComicInfo.xml in the CBZ
             ci_root = etree.Element('ComicInfo', nsmap=ci_ns)
 
             for key in metadata_keys:
@@ -84,28 +147,13 @@ def convert_epub_to_cbz(epub_path, output_dir):
             # print(f"[*] ComicInfo.xml: \n{comic_info_xml}")
             cbz.writestr('ComicInfo.xml', comic_info_xml)
 
-            # 4. Extract images based on the Spine order and add to CBZ
+            # 7. Write page images in spine order
             page_idx = 1
-            for itemref in spine_items:
-                href = manifest.get(itemref.get('idref'))
-                if not href:
-                    continue
-
-                full_href_path = os.path.join(opf_dir, href).replace('\\', '/')
-                
-                # If spine points to HTML, find the image inside it
-                if href.endswith(('.html', '.xhtml')):
-                    h_root = etree.fromstring(z.read(full_href_path))
-                    img_srcs = h_root.xpath('//xhtml:img/@src | //svg:image/@xlink:href | //svg:image/@href', namespaces=svg_ns)
-                    for src in img_srcs:
-                        img_path = os.path.normpath(os.path.join(os.path.dirname(full_href_path), src)).replace('\\', '/')
-                        if store_image(z, img_path, cbz, page_idx):
-                            page_idx += 1
-                # If spine points directly to an image
-                elif href.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    if store_image(z, full_href_path, cbz, page_idx):
+            for img_paths in pages:
+                for img_path in img_paths:
+                    if store_image(z, img_path, cbz, page_idx):
                         page_idx += 1
-        
+
         print(f"[*] Conversion complete: {cbz_path}")
 
 def store_image(zip_ref, zip_path, cbz_ref, idx):
@@ -117,6 +165,51 @@ def store_image(zip_ref, zip_path, cbz_ref, idx):
     with zip_ref.open(zip_path) as src:
         cbz_ref.writestr(new_name, src.read())
     return True
+
+def visible_text_length(h_root):
+    # Count non-whitespace body text, ignoring <script>/<style> so that inline
+    # CSS on manga image pages isn't mistaken for prose.
+    for el in h_root.xpath('//*[local-name()="script" or local-name()="style"]'):
+        parent = el.getparent()
+        if parent is not None:
+            parent.remove(el)
+    bodies = h_root.xpath('//*[local-name()="body"]')
+    node = bodies[0] if bodies else h_root
+    return len(re.sub(r'\s+', '', ''.join(node.itertext())))
+
+def epub_tag_set(metadata):
+    return {t.strip().lower() for t in metadata.get('Tags', '').split(',') if t.strip()}
+
+def is_light_novel(metadata, image_pages, text_pages):
+    tag_set = epub_tag_set(metadata)
+    # Manual overrides win over any automatic guess.
+    if tag_set & FORCE_MANGA_TAGS:
+        return False
+    if tag_set & FORCE_SKIP_TAGS:
+        return True
+    # Kobo/Rakuten genre hint.
+    tags_joined = metadata.get('Tags', '').lower()
+    if any(keyword.lower() in tags_joined for keyword in LIGHT_NOVEL_KEYWORDS):
+        return True
+    # Content heuristic: a manga is (almost) all full-page images, while a light
+    # novel is mostly prose with a handful of illustration inserts.
+    if image_pages == 0:
+        return True
+    return text_pages > image_pages
+
+def should_skip_ocr(metadata):
+    if epub_tag_set(metadata) & FORCE_NO_OCR_TAGS:
+        return True
+    lang = metadata.get('LanguageISO', '').lower()
+    # Only auto-skip when the language is known and clearly not Japanese; treat
+    # a missing language as Japanese since the library is Japanese manga.
+    return bool(lang) and not lang.startswith(JAPANESE_LANG_PREFIX)
+
+def mark_no_ocr(series_dir):
+    os.makedirs(series_dir, exist_ok=True)
+    marker = os.path.join(series_dir, '_no_ocr')
+    if not os.path.exists(marker):
+        open(marker, 'a').close()
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
