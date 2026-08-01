@@ -1,0 +1,11 @@
+# Requires Python 3.14 (tested on 3.14.6).
+# Setup:
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#   .venv/bin/python process_epub.py <epub_dir> [output_dir]
+
+# 6.0.1 is the first release shipping cp314 wheels; older versions build from source.
+lxml>=6.0.1
+
+# Provides the `mokuro` CLI invoked by process_epub.py. Must live on PATH, so run
+# the script from this venv (.venv/bin/python) rather than a bare `python3`.
+mokuro>=0.2.5

@@ -233,6 +233,14 @@ def mark_no_ocr(series_dir):
     if not os.path.exists(marker):
         open(marker, 'a').close()
 
+def find_mokuro():
+    # Prefer the mokuro installed next to the interpreter running this script.
+    # Launching as `.venv/bin/python process_epub.py` does not put `.venv/bin` on
+    # PATH, so a bare "mokuro" would silently pick up a copy from some other
+    # Python install instead of the one this venv's deps were tested against.
+    return (shutil.which('mokuro', path=os.path.dirname(sys.executable))
+            or shutil.which('mokuro'))
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Convert manga EPUBs to CBZ (skipping light novels) and OCR them with Mokuro.")
@@ -259,9 +267,14 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # Run Mokuro to process the CBZ files
+    mokuro_cmd = find_mokuro()
+    if mokuro_cmd is None:
+        print("Error: `mokuro` not found. Install it with: pip install -r requirements.txt")
+        sys.exit(1)
+
     for item in Path(args.output_dir).iterdir():
         if item.is_dir():
             if (item / "_no_ocr").exists():
                 print(f"[-] Skipping: {item.name} marked as no OCR")
                 continue
-            subprocess.run(["mokuro", "-l=False", "--disable-confirmation=True", f"--parent_dir={item.absolute()}"])
+            subprocess.run([mokuro_cmd, "-l=False", "--disable-confirmation=True", f"--parent_dir={item.absolute()}"])
