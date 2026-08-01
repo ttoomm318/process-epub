@@ -3,6 +3,7 @@ import re
 import sys
 import zipfile
 import shutil
+import argparse
 import subprocess
 from lxml import etree
 from pathlib import Path
@@ -44,7 +45,7 @@ FORCE_NO_OCR_TAGS = {'no-ocr', 'no_ocr', 'noocr'}
 # Automatic light-novel hints from Kobo/Rakuten metadata (substring match).
 LIGHT_NOVEL_KEYWORDS = {'ライトノベル', 'ラノベ', 'light novel'}
 
-def convert_epub_to_cbz(epub_path, output_dir):
+def convert_epub_to_cbz(epub_path, output_dir, dry_run=False):
     # Unzip the EPUB file
     with zipfile.ZipFile(epub_path, 'r') as z:
         # 1. Find the OPF file
@@ -64,7 +65,8 @@ def convert_epub_to_cbz(epub_path, output_dir):
         metadata['Series'] = seriesList[0] if seriesList else 'Unknown Series'
         numbers = metadata_tree.xpath('opf:meta[@property="group-position"]/text()', namespaces=opf_ns)
         metadata['Number'] = numbers[0] if numbers else ''
-        print(f"[*] Processing: {metadata['Series']} - {metadata['Number']}")
+        if not dry_run:
+            print(f"[*] Processing: {metadata['Series']} - {metadata['Number']}")
         metadata['Writer'] = ",".join(metadata_tree.xpath('dc:creator/text()', namespaces=dc_ns))
         languages = metadata_tree.xpath('dc:language/text()', namespaces=dc_ns)
         metadata['LanguageISO'] = languages[0] if languages else ''
@@ -115,9 +117,22 @@ def convert_epub_to_cbz(epub_path, output_dir):
                 image_page_count += 1
                 pages.append([full_href_path])
 
-        # 4. Skip light novels entirely (no CBZ, no OCR).
-        if is_light_novel(metadata, image_page_count, text_page_count):
-            print(f"[-] Skipping light novel: {metadata['Title']}")
+        # 4. Classify: light novel -> skip entirely; manga -> convert (+ maybe OCR).
+        is_ln, ln_reason = is_light_novel(metadata, image_page_count, text_page_count)
+        skip_ocr, ocr_reason = should_skip_ocr(metadata)
+
+        if dry_run:
+            stats = f"imgs={image_page_count} text={text_page_count}"
+            if is_ln:
+                print(f"[DRY] LIGHT NOVEL (skip) | {stats:<20} | {ln_reason:<28} | {metadata['Series']} - {metadata['Title']}")
+            else:
+                verdict = 'MANGA no-OCR' if skip_ocr else 'MANGA + OCR '
+                reason = ocr_reason if skip_ocr else f"{ln_reason}; {ocr_reason}"
+                print(f"[DRY] {verdict}     | {stats:<20} | {reason:<28} | {metadata['Series']} - {metadata['Title']}")
+            return
+
+        if is_ln:
+            print(f"[-] Skipping light novel: {metadata['Title']} ({ln_reason})")
             return
 
         cbz_path = os.path.join(output_dir, metadata['Series'], f"{metadata['Title']}.cbz")
@@ -126,9 +141,9 @@ def convert_epub_to_cbz(epub_path, output_dir):
 
         # 5. Auto-mark series that should skip Mokuro OCR (replaces the manual
         #    _no_ocr file). The marker is honored by the mokuro loop below.
-        if should_skip_ocr(metadata):
+        if skip_ocr:
             mark_no_ocr(series_dir)
-            print(f"[*] Marking no-OCR: {metadata['Series']}")
+            print(f"[*] Marking no-OCR: {metadata['Series']} ({ocr_reason})")
 
         if os.path.exists(cbz_path):
             print(f"[-] Skipping: {metadata['Title']} (CBZ already exists)")
@@ -181,29 +196,36 @@ def epub_tag_set(metadata):
     return {t.strip().lower() for t in metadata.get('Tags', '').split(',') if t.strip()}
 
 def is_light_novel(metadata, image_pages, text_pages):
+    """Return (is_light_novel, reason)."""
     tag_set = epub_tag_set(metadata)
     # Manual overrides win over any automatic guess.
     if tag_set & FORCE_MANGA_TAGS:
-        return False
+        return False, 'force-manga tag'
     if tag_set & FORCE_SKIP_TAGS:
-        return True
+        return True, 'skip tag'
     # Kobo/Rakuten genre hint.
     tags_joined = metadata.get('Tags', '').lower()
-    if any(keyword.lower() in tags_joined for keyword in LIGHT_NOVEL_KEYWORDS):
-        return True
+    hit = next((k for k in LIGHT_NOVEL_KEYWORDS if k.lower() in tags_joined), None)
+    if hit:
+        return True, f'genre tag "{hit}"'
     # Content heuristic: a manga is (almost) all full-page images, while a light
     # novel is mostly prose with a handful of illustration inserts.
     if image_pages == 0:
-        return True
-    return text_pages > image_pages
+        return True, 'no image pages'
+    if text_pages > image_pages:
+        return True, f'text pages {text_pages} > image pages {image_pages}'
+    return False, f'image pages {image_pages} >= text pages {text_pages}'
 
 def should_skip_ocr(metadata):
+    """Return (skip_ocr, reason)."""
     if epub_tag_set(metadata) & FORCE_NO_OCR_TAGS:
-        return True
+        return True, 'no-ocr tag'
     lang = metadata.get('LanguageISO', '').lower()
     # Only auto-skip when the language is known and clearly not Japanese; treat
     # a missing language as Japanese since the library is Japanese manga.
-    return bool(lang) and not lang.startswith(JAPANESE_LANG_PREFIX)
+    if lang and not lang.startswith(JAPANESE_LANG_PREFIX):
+        return True, f'language "{lang}"'
+    return False, f'language "{lang or "unknown"}"'
 
 def mark_no_ocr(series_dir):
     os.makedirs(series_dir, exist_ok=True)
@@ -212,21 +234,32 @@ def mark_no_ocr(series_dir):
         open(marker, 'a').close()
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python process-epub.py <path_to_epub_folder> [output_directory]")
+    parser = argparse.ArgumentParser(
+        description="Convert manga EPUBs to CBZ (skipping light novels) and OCR them with Mokuro.")
+    parser.add_argument("epub_dir", help="Folder searched recursively for .epub files")
+    parser.add_argument("output_dir", nargs="?", default="output",
+                        help="Output directory (default: output)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Only print how each EPUB would be classified; write nothing and skip Mokuro.")
+    args = parser.parse_args()
+
+    if not os.path.isdir(args.epub_dir):
+        print(f"Error: {args.epub_dir} is not a valid directory.")
         sys.exit(1)
-    epub_dir = sys.argv[1]
-    if (not os.path.isdir(epub_dir)):
-        print(f"Error: {epub_dir} is not a valid directory.")
-        sys.exit(1)
-    output_dir = sys.argv[2] if len(sys.argv) > 2 else 'output'
-    os.makedirs(output_dir, exist_ok=True)
-    for file in list(Path(epub_dir).rglob('*.epub')):
+
+    if not args.dry_run:
+        os.makedirs(args.output_dir, exist_ok=True)
+
+    for file in list(Path(args.epub_dir).rglob('*.epub')):
         if file.name.endswith('.epub'):
-            convert_epub_to_cbz(file.absolute(), output_dir)
-    
-    # 5. Run Mokuro to process the CBZ files
-    for item in Path(output_dir).iterdir():
+            convert_epub_to_cbz(file.absolute(), args.output_dir, dry_run=args.dry_run)
+
+    if args.dry_run:
+        print("[DRY] Dry run complete — no files written, Mokuro not run.")
+        sys.exit(0)
+
+    # Run Mokuro to process the CBZ files
+    for item in Path(args.output_dir).iterdir():
         if item.is_dir():
             if (item / "_no_ocr").exists():
                 print(f"[-] Skipping: {item.name} marked as no OCR")
