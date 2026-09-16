@@ -27,23 +27,50 @@ svg_ns = {
 # ---------------------------------------------------------------------------
 # A spine page counts as "text-heavy" once it has at least this many
 # non-whitespace characters of body text. Manga image pages have ~none;
-# light-novel prose pages have hundreds+.
+# prose pages have hundreds+. Only feeds the --dry-run readout now.
 TEXT_PAGE_MIN_CHARS = 200
+
+# A book holding at least this much body text overall is prose, not manga.
+# Counting *pages* cannot tell the two apart: a novel packs a whole chapter
+# into a single spine page while every illustration gets its own, so novels
+# routinely show more image pages than text pages (混物語: 22 image pages vs
+# 16 text pages, yet 288k characters of prose). Total volume is decisive --
+# across a 569-book library every manga had exactly 0 characters of body text
+# and the shortest novel had ~38,000.
+PROSE_MIN_TOTAL_CHARS = 20000
 
 # Language codes treated as Japanese. Mokuro OCR only helps Japanese text, so
 # anything else is auto-marked no-OCR.
 JAPANESE_LANG_PREFIX = 'ja'
 
 # --- Manual overrides: add these as tags in Calibre before exporting ---
-# Force-treat as a light novel -> skip entirely (no CBZ, no OCR).
-FORCE_SKIP_TAGS = {'light-novel', 'light novel', 'ln', 'skip'}
-# Force-treat as manga even if the content heuristic guesses light novel.
+# Force-treat as prose -> skip entirely (no CBZ, no OCR). Matched exactly.
+FORCE_SKIP_TAGS = {'light-novel', 'light novel', 'ln', 'novel', 'skip'}
+# Force-treat as manga even if the content heuristic guesses prose.
 FORCE_MANGA_TAGS = {'manga', 'force-manga'}
 # Convert to CBZ but skip Mokuro OCR (the automated _no_ocr replacement).
 FORCE_NO_OCR_TAGS = {'no-ocr', 'no_ocr', 'noocr'}
 
-# Automatic light-novel hints from Kobo/Rakuten metadata (substring match).
-LIGHT_NOVEL_KEYWORDS = {'ライトノベル', 'ラノベ', 'light novel'}
+# Rakuten Books / Kobo genre strings, matched as case-insensitive substrings.
+#
+# MANGA_KEYWORDS is tested FIRST and wins, because several manga genre strings
+# embed a prose word: "コミック・グラフィックノベル・漫画" contains "ノベル",
+# "Comics Graphic Novels & Manga" contains "novel", and "漫畫、圖畫小說和漫畫"
+# contains "小說". Testing prose first would flag every one of those as a novel.
+# Ordered most-canonical first: the first hit is what the log line reports, so
+# "コミック・グラフィックノベル・漫画" should read as 漫画, not グラフィックノベル.
+MANGA_KEYWORDS = (
+    '漫画', '漫畫', 'マンガ', 'まんが', 'コミック', '連環漫畫',
+    'manga', 'comic', '圖畫小說', 'グラフィックノベル', 'graphic novel',
+)
+# Prose formats -> skip the book entirely. The store tags novels 小説・文学 at
+# least as often as ライトノベル (226 vs 191 across the library), which is what
+# the old ライトノベル-only check missed.
+PROSE_KEYWORDS = (
+    'ライトノベル', 'ラノベ', 'light novel',
+    '小説', '小說', '文芸', '文藝', '文学', '文學',
+    'novel', 'fiction', 'literature', 'poetry',
+)
 
 def convert_epub_to_cbz(epub_path, output_dir, dry_run=False):
     # Unzip the EPUB file
@@ -95,6 +122,7 @@ def convert_epub_to_cbz(epub_path, output_dir, dry_run=False):
         pages = []            # ordered list of in-zip image paths per spine entry
         image_page_count = 0  # spine pages holding at least one image
         text_page_count = 0   # spine pages that are text-heavy (prose)
+        text_char_count = 0   # body-text characters across the whole book
         for itemref in spine_items:
             href = manifest.get(itemref.get('idref'))
             if not href:
@@ -109,7 +137,9 @@ def convert_epub_to_cbz(epub_path, output_dir, dry_run=False):
                 img_paths = [os.path.normpath(os.path.join(os.path.dirname(full_href_path), src)).replace('\\', '/') for src in img_srcs]
                 if img_paths:
                     image_page_count += 1
-                if visible_text_length(h_root) >= TEXT_PAGE_MIN_CHARS:
+                page_chars = visible_text_length(h_root)
+                text_char_count += page_chars
+                if page_chars >= TEXT_PAGE_MIN_CHARS:
                     text_page_count += 1
                 pages.append(img_paths)
             # If spine points directly to an image
@@ -117,22 +147,22 @@ def convert_epub_to_cbz(epub_path, output_dir, dry_run=False):
                 image_page_count += 1
                 pages.append([full_href_path])
 
-        # 4. Classify: light novel -> skip entirely; manga -> convert (+ maybe OCR).
-        is_ln, ln_reason = is_light_novel(metadata, image_page_count, text_page_count)
+        # 4. Classify: prose -> skip entirely; manga -> convert (+ maybe OCR).
+        is_prose, prose_reason = is_non_manga(metadata, image_page_count, text_char_count)
         skip_ocr, ocr_reason = should_skip_ocr(metadata)
 
         if dry_run:
-            stats = f"imgs={image_page_count} text={text_page_count}"
-            if is_ln:
-                print(f"[DRY] LIGHT NOVEL (skip) | {stats:<20} | {ln_reason:<28} | {metadata['Series']} - {metadata['Title']}")
+            stats = f"imgs={image_page_count} txt={text_page_count} ch={text_char_count}"
+            if is_prose:
+                print(f"[DRY] NOT MANGA (skip)   | {stats:<28} | {prose_reason:<30} | {metadata['Series']} - {metadata['Title']}")
             else:
                 verdict = 'MANGA no-OCR' if skip_ocr else 'MANGA + OCR '
-                reason = ocr_reason if skip_ocr else f"{ln_reason}; {ocr_reason}"
-                print(f"[DRY] {verdict}     | {stats:<20} | {reason:<28} | {metadata['Series']} - {metadata['Title']}")
+                reason = ocr_reason if skip_ocr else f"{prose_reason}; {ocr_reason}"
+                print(f"[DRY] {verdict}     | {stats:<28} | {reason:<30} | {metadata['Series']} - {metadata['Title']}")
             return
 
-        if is_ln:
-            print(f"[-] Skipping light novel: {metadata['Title']} ({ln_reason})")
+        if is_prose:
+            print(f"[-] Skipping non-manga: {metadata['Title']} ({prose_reason})")
             return
 
         cbz_path = os.path.join(output_dir, metadata['Series'], f"{metadata['Title']}.cbz")
@@ -195,26 +225,35 @@ def visible_text_length(h_root):
 def epub_tag_set(metadata):
     return {t.strip().lower() for t in metadata.get('Tags', '').split(',') if t.strip()}
 
-def is_light_novel(metadata, image_pages, text_pages):
-    """Return (is_light_novel, reason)."""
+def _keyword_hit(tags_joined, keywords):
+    # keywords is ordered, so the reported hit is the most canonical one.
+    return next((k for k in keywords if k.lower() in tags_joined), None)
+
+def is_non_manga(metadata, image_pages, text_chars):
+    """Return (should_skip, reason) -- True for prose (novels, light novels)."""
     tag_set = epub_tag_set(metadata)
     # Manual overrides win over any automatic guess.
     if tag_set & FORCE_MANGA_TAGS:
         return False, 'force-manga tag'
     if tag_set & FORCE_SKIP_TAGS:
         return True, 'skip tag'
-    # Kobo/Rakuten genre hint.
+
+    # Store genre tags. Manga markers are tested first -- see MANGA_KEYWORDS.
     tags_joined = metadata.get('Tags', '').lower()
-    hit = next((k for k in LIGHT_NOVEL_KEYWORDS if k.lower() in tags_joined), None)
-    if hit:
-        return True, f'genre tag "{hit}"'
-    # Content heuristic: a manga is (almost) all full-page images, while a light
-    # novel is mostly prose with a handful of illustration inserts.
+    manga_hit = _keyword_hit(tags_joined, MANGA_KEYWORDS)
+    prose_hit = _keyword_hit(tags_joined, PROSE_KEYWORDS)
+    if manga_hit and text_chars < PROSE_MIN_TOTAL_CHARS:
+        return False, f'genre tag "{manga_hit}"'
+    if prose_hit:
+        return True, f'genre tag "{prose_hit}"'
+
+    # No usable genre tag (or a manga tag contradicted by a wall of prose):
+    # fall back to how much body text the book actually carries.
+    if text_chars >= PROSE_MIN_TOTAL_CHARS:
+        return True, f'{text_chars} chars of prose'
     if image_pages == 0:
         return True, 'no image pages'
-    if text_pages > image_pages:
-        return True, f'text pages {text_pages} > image pages {image_pages}'
-    return False, f'image pages {image_pages} >= text pages {text_pages}'
+    return False, f'{image_pages} image pages, {text_chars} chars'
 
 def should_skip_ocr(metadata):
     """Return (skip_ocr, reason)."""
